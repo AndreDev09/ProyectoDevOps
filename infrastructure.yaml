@@ -1,0 +1,490 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DevOps Project — Infraestructura base con EC2, S3 y configuración de red.
+  Compatible con AWS Learner Lab (usa LabRole preexistente, sin crear roles/grupos).
+  Probado con LocalStack v3+.
+
+# METADATOS — Organización visual en la consola CloudFormation
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Configuración de Red"
+        Parameters: [VpcCidr, PublicSubnetCidr, PrivateSubnetCidr]
+      - Label:
+          default: "Configuración de EC2"
+        Parameters: [InstanceType, KeyPairName, WebServerCount]
+      - Label:
+          default: "Configuración de S3"
+        Parameters: [BucketPrefix, EnableVersioning]
+      - Label:
+          default: "IAM (Learner Lab)"
+        Parameters: [LabRoleArn]
+    ParameterLabels:
+      InstanceType:   { default: "Tipo de instancia EC2" }
+      KeyPairName:    { default: "Nombre del Key Pair" }
+      WebServerCount: { default: "Número de instancias web" }
+      LabRoleArn:     { default: "ARN del LabRole" }
+
+
+# PARÁMETROS
+
+Parameters:
+
+  # ── Red ──
+  VpcCidr:
+    Type: String
+    Default: "10.0.0.0/16"
+    Description: "CIDR block para la VPC"
+    AllowedPattern: "^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$"
+
+  PublicSubnetCidr:
+    Type: String
+    Default: "10.0.1.0/24"
+    Description: "CIDR block para la subred pública"
+
+  PrivateSubnetCidr:
+    Type: String
+    Default: "10.0.2.0/24"
+    Description: "CIDR block para la subred privada"
+
+  # ── EC2 ──
+  InstanceType:
+    Type: String
+    Default: "t2.micro"
+    Description: "Tipo de instancia EC2 (solo tamaños permitidos por Learner Lab)"
+    AllowedValues:
+      - t2.nano
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+      - t3.nano
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+
+  KeyPairName:
+    Type: String
+    Default: "devops-key"
+    Description: "Nombre del Key Pair EC2 (debe existir previamente)"
+
+  AmiId:
+    Type: String
+    Default: "ami-0c55b159cbfafe1f0"
+    Description: "AMI ID (en LocalStack cualquier string es válido)"
+
+  WebServerCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 3   # Conservador: dejar espacio para otras instancias
+    Description: "Número de instancias web (máx. 3 para respetar límite de 9)"
+
+  # ── S3 ──
+  BucketPrefix:
+    Type: String
+    Default: "devops-project"
+    Description: "Prefijo para los nombres de buckets S3"
+    AllowedPattern: "^[a-z0-9-]+$"
+    ConstraintDescription: "Solo minúsculas, números y guiones"
+
+  EnableVersioning:
+    Type: String
+    Default: "Enabled"
+    AllowedValues: ["Enabled", "Suspended"]
+    Description: "Habilitar versionado en S3"
+
+  # ── IAM (Learner Lab) ──
+  LabRoleArn:
+    Type: String
+    Default: "arn:aws:iam::000000000000:role/LabRole"
+    Description: >
+      ARN del LabRole preexistente en Learner Lab.
+      No se crean nuevos roles. En LocalStack usa el valor por defecto.
+
+  Environment:
+    Type: String
+    Default: "localstack"
+    AllowedValues: ["localstack", "development", "staging"]
+    Description: "Entorno de despliegue"
+
+
+# CONDICIONES
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, "production"]
+  EnableS3Versioning: !Equals [!Ref EnableVersioning, "Enabled"]
+
+
+# RECURSOS
+
+Resources:
+
+
+  # SECCIÓN 1: VPC Y RED
+
+
+  DevOpsVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${BucketPrefix}-vpc"
+        - Key: Project
+          Value: devops-project
+        - Key: Environment
+          Value: !Ref Environment
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${BucketPrefix}-igw"
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref DevOpsVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ── Subredes ──
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref DevOpsVPC
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${BucketPrefix}-public-subnet"
+        - Key: Type
+          Value: public
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref DevOpsVPC
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${BucketPrefix}-private-subnet"
+        - Key: Type
+          Value: private
+
+  # ── Routing ──
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref DevOpsVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${BucketPrefix}-public-rt"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+
+  # SECCIÓN 2: SECURITY GROUPS
+
+
+  WebServerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${BucketPrefix}-web-sg"
+      GroupDescription: "Security group para servidores web"
+      VpcId: !Ref DevOpsVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+          Description: "HTTP"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+          Description: "HTTPS"
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: "0.0.0.0/0"
+          Description: "SSH (restringir en producción)"
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: "0.0.0.0/0"
+          Description: "App server alternativo"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+          Description: "Todo tráfico saliente"
+      Tags:
+        - Key: Name
+          Value: !Sub "${BucketPrefix}-web-sg"
+
+
+  # SECCIÓN 3: EC2 — INSTANCIAS
+  # Nota: Usamos LabRole preexistente como IamInstanceProfile
+  #       NO se crean roles ni instance profiles nuevos.
+
+
+  # Instancia de Bastion / Servidor principal
+  BastionInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref WebServerSG
+      # IamInstanceProfile: usa LabRole preexistente
+      IamInstanceProfile: !Ref LabRoleArn
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp2
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -ex
+          yum update -y || apt-get update -y
+          # Instalar herramientas básicas
+          which yum && yum install -y python3 git curl || \
+            apt-get install -y python3 git curl
+          # Instalar AWS CLI
+          pip3 install awscli boto3 --quiet || true
+          # Señal de readiness
+          echo "Bastion instance ready at $(date)" > /tmp/init_done.txt
+          # Configurar awslocal para apuntar a LocalStack si aplica
+          echo "export AWS_DEFAULT_REGION=us-east-1" >> /etc/profile.d/aws.sh
+      Tags:
+        - Key: Name
+          Value: !Sub "${BucketPrefix}-bastion"
+        - Key: Role
+          Value: bastion
+        - Key: Project
+          Value: devops-project
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Instancias web (se crean según WebServerCount usando un Launch Template)
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${BucketPrefix}-web-lt"
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyPairName
+        SecurityGroupIds:
+          - !Ref WebServerSG
+        IamInstanceProfile:
+          Arn: !Ref LabRoleArn
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp2
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -ex
+            yum update -y || apt-get update -y
+            # Nginx
+            which yum && yum install -y nginx || apt-get install -y nginx
+            systemctl enable nginx && systemctl start nginx || true
+            # Página de prueba
+            cat > /var/www/html/index.html <<'HTML'
+            <!DOCTYPE html><html><body>
+            <h1>DevOps Project — Web Server</h1>
+            <p>Stack: ${AWS::StackName} | Region: ${AWS::Region}</p>
+            </body></html>
+            HTML
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${BucketPrefix}-web"
+              - Key: Role
+                Value: webserver
+              - Key: Project
+                Value: devops-project
+
+  # Instancia web 1
+  WebServer1:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub "${BucketPrefix}-web-1"
+
+  # Instancia web 2 (condicional si WebServerCount >= 2)
+  WebServer2:
+    Type: AWS::EC2::Instance
+    Condition: IsProduction   # En LocalStack siempre se crea; ajusta la condición según tu entorno
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub "${BucketPrefix}-web-2"
+
+
+  # SECCIÓN 4: S3 BUCKETS
+
+
+  # Bucket principal de la aplicación
+  AppBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${BucketPrefix}-app-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: !Ref EnableVersioning
+      LifecycleConfiguration:
+        Rules:
+          - Id: "delete-old-versions"
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+          - Id: "transition-to-ia"
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ["*"]
+            AllowedMethods: [GET, PUT, POST]
+            AllowedOrigins: ["*"]
+            MaxAge: 3600
+      Tags:
+        - Key: Name
+          Value: !Sub "${BucketPrefix}-app"
+        - Key: Project
+          Value: devops-project
+
+  # Bucket para logs
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${BucketPrefix}-logs-${AWS::AccountId}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: "expire-logs"
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub "${BucketPrefix}-logs"
+        - Key: Purpose
+          Value: logs
+
+  # Bucket para artefactos CI/CD
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${BucketPrefix}-artifacts-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: !Sub "${BucketPrefix}-artifacts"
+        - Key: Purpose
+          Value: cicd-artifacts
+
+
+  # SECCIÓN 5: CODECOMMIT (repositorio de código)
+
+
+  CodeRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Sub "${BucketPrefix}-repo"
+      RepositoryDescription: "Repositorio principal del proyecto DevOps"
+      Tags:
+        - Key: Project
+          Value: devops-project
+
+
+# OUTPUTS
+
+Outputs:
+
+  VpcId:
+    Description: "ID de la VPC"
+    Value: !Ref DevOpsVPC
+    Export:
+      Name: !Sub "${AWS::StackName}-VpcId"
+
+  PublicSubnetId:
+    Description: "ID de la subred pública"
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub "${AWS::StackName}-PublicSubnetId"
+
+  BastionInstanceId:
+    Description: "ID de la instancia Bastion"
+    Value: !Ref BastionInstance
+    Export:
+      Name: !Sub "${AWS::StackName}-BastionId"
+
+  WebServer1Id:
+    Description: "ID del Web Server 1"
+    Value: !Ref WebServer1
+
+  AppBucketName:
+    Description: "Nombre del bucket principal"
+    Value: !Ref AppBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-AppBucket"
+
+  LogsBucketName:
+    Description: "Nombre del bucket de logs"
+    Value: !Ref LogsBucket
+
+  ArtifactsBucketName:
+    Description: "Nombre del bucket de artefactos"
+    Value: !Ref ArtifactsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-ArtifactsBucket"
+
+  CodeRepositoryCloneUrl:
+    Description: "URL para clonar el repositorio CodeCommit"
+    Value: !GetAtt CodeRepository.CloneUrlHttp
+
+  SecurityGroupId:
+    Description: "ID del Security Group web"
+    Value: !Ref WebServerSG
+    Export:
+      Name: !Sub "${AWS::StackName}-WebSG"
