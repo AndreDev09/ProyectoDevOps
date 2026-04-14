@@ -1,0 +1,273 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DevOps Project — Pipeline CI/CD completo con CodeCommit, CodeBuild, CodePipeline,
+  Lambda de rollback y SSM Session Manager. Compatible con LocalStack.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: "devops-project"
+
+  RepositoryName:
+    Type: String
+    Default: "devops-project-repo"
+
+  BranchName:
+    Type: String
+    Default: "main"
+
+  ArtifactsBucket:
+    Type: String
+    Default: "devops-project-artifacts"
+
+  LabRoleArn:
+    Type: String
+    Default: "arn:aws:iam::000000000000:role/LabRole"
+    Description: "ARN del LabRole (Learner Lab). NO se crean nuevos roles."
+
+  Environment:
+    Type: String
+    Default: "localstack"
+    AllowedValues: ["localstack", "development", "staging"]
+
+Resources:
+
+
+  # CodeCommit — Repositorio de código fuente
+
+  SourceRepo:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      RepositoryDescription: !Sub "Repositorio principal para ${ProjectName}"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+
+  # CodeBuild — Proyecto de build y tests
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${ProjectName}-build"
+      Description: "Build, test y push de imagen Docker"
+      ServiceRole: !Ref LabRoleArn
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:7.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        PrivilegedMode: true     # Requerido para Docker-in-Docker
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+          - Name: STACK_NAME
+            Value: !Sub "${ProjectName}-stack"
+          - Name: ARTIFACTS_BUCKET
+            Value: !Ref ArtifactsBucket
+          - Name: LOCALSTACK_ENDPOINT
+            Value: "http://localhost:4566"
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+      Source:
+        Type: CODECOMMIT
+        Location: !GetAtt SourceRepo.CloneUrlHttp
+        BuildSpec: cicd/buildspec/buildspec.yml
+      Artifacts:
+        Type: S3
+        Location: !Ref ArtifactsBucket
+        Name: !Sub "${ProjectName}-artifacts"
+        Packaging: ZIP
+        EncryptionDisabled: true
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub "/aws/codebuild/${ProjectName}"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+
+  # Lambda — Función de rollback automático
+
+  RollbackFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-rollback"
+      Description: "Rollback automático ante fallos en CodePipeline"
+      Runtime: python3.11
+      Handler: rollback_lambda.lambda_handler
+      Role: !Ref LabRoleArn
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENVIRONMENT:        !Ref Environment
+          STACK_NAME:         !Sub "${ProjectName}-stack"
+          ARTIFACTS_BUCKET:   !Ref ArtifactsBucket
+          PIPELINE_NAME:      !Sub "${ProjectName}-pipeline"
+          LOCALSTACK_ENDPOINT: "http://localstack:4566"
+          AWS_DEFAULT_REGION: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          # Placeholder — reemplazar con el código real de rollback_lambda.py
+          import json
+          def lambda_handler(event, context):
+              print(f"Rollback activado: {json.dumps(event)}")
+              return {"statusCode": 200, "body": "Rollback OK"}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+
+  # CloudWatch Event Rule — Activa Lambda ante fallos del pipeline
+
+  PipelineFailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-pipeline-failure"
+      Description: "Activa rollback Lambda cuando CodePipeline falla"
+      EventPattern:
+        source:
+          - "aws.codepipeline"
+        detail-type:
+          - "CodePipeline Pipeline Execution State Change"
+        detail:
+          state:
+            - "FAILED"
+          pipeline:
+            - !Sub "${ProjectName}-pipeline"
+      State: ENABLED
+      Targets:
+        - Id: "RollbackLambdaTarget"
+          Arn: !GetAtt RollbackFunction.Arn
+
+  RollbackLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RollbackFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PipelineFailureRule.Arn
+
+
+  # CodePipeline — Pipeline principal de CI/CD
+
+  MainPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${ProjectName}-pipeline"
+      RoleArn: !Ref LabRoleArn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactsBucket
+
+      Stages:
+
+        # ── Stage 1: Source (CodeCommit) ──
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: "1"
+              OutputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                RepositoryName: !Ref RepositoryName
+                BranchName: !Ref BranchName
+                PollForSourceChanges: "true"
+              RunOrder: 1
+
+        # ── Stage 2: Build & Test (CodeBuild) ──
+        - Name: BuildAndTest
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ProjectName: !Ref BuildProject
+              RunOrder: 1
+
+        # ── Stage 3: Deploy (CloudFormation) ──
+        - Name: Deploy
+          Actions:
+            - Name: Deploy-Infrastructure
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              InputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: !Sub "${ProjectName}-stack"
+                TemplatePath: "BuildArtifact::cloudformation/infrastructure.yaml"
+                Capabilities: CAPABILITY_IAM,CAPABILITY_AUTO_EXPAND
+                RoleArn: !Ref LabRoleArn
+                ParameterOverrides: !Sub |
+                  {
+                    "Environment": "${Environment}",
+                    "BucketPrefix": "${ProjectName}"
+                  }
+              RunOrder: 1
+
+            # ── Enviar archivos a EC2 via SSM Session Manager ──
+            - Name: Deploy-App-via-SSM
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              InputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                FunctionName: !Ref RollbackFunction   # En producción, usar Lambda de deploy
+                UserParameters: |
+                  {"action": "ssm_deploy", "target": "tag:Project=devops-project"}
+              RunOrder: 2
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+
+  # CloudWatch Logs — Grupo de logs del pipeline
+
+  PipelineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/devops/${ProjectName}/pipeline"
+      RetentionInDays: 30
+
+Outputs:
+
+  PipelineName:
+    Description: "Nombre del pipeline CI/CD"
+    Value: !Ref MainPipeline
+
+  RepositoryCloneUrl:
+    Description: "URL HTTPS para clonar el repositorio"
+    Value: !GetAtt SourceRepo.CloneUrlHttp
+
+  BuildProjectName:
+    Description: "Nombre del proyecto CodeBuild"
+    Value: !Ref BuildProject
+
+  RollbackFunctionArn:
+    Description: "ARN de la Lambda de rollback"
+    Value: !GetAtt RollbackFunction.Arn
+
+  PipelineConsoleUrl:
+    Description: "URL de la consola de CodePipeline"
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${ProjectName}-pipeline/view"
