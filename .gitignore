@@ -1,3 +1,20 @@
+# LocalStack datos locales
+localstack-data/
+
+# Python
 __pycache__/
 *.pyc
-reports/*.json
+*.pyo
+.env
+
+# Docker
+*.log
+
+# VS Code
+.vscode/
+
+# MacOS
+.DS_Store
+
+# Logs de la app
+app/logs/
