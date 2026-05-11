@@ -1,0 +1,16 @@
+{
+  "GroupName": "SecureEC2Group",
+  "Description": "Restrict SSH access",
+  "InboundRules": [
+    {
+      "Protocol": "TCP",
+      "Port": 80,
+      "Source": "0.0.0.0/0"
+    },
+    {
+      "Protocol": "TCP",
+      "Port": 22,
+      "Source": "192.168.1.15/32"
+    }
+  ]
+}
