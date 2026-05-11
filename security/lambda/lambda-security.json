@@ -1,0 +1,9 @@
+{
+  "FunctionName": "rollbackLambda",
+  "Runtime": "python3.12",
+  "ConcurrentExecutions": 10,
+  "Permissions": {
+    "Invoke": true,
+    "AdminAccess": false
+  }
+}
