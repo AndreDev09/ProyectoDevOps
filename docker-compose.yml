@@ -21,7 +21,7 @@ services:
       - "4566:4566"
     environment:
       - LOCALSTACK_AUTH_TOKEN=ls-tuSIkaTe-XAqI-DIki-pUjE-9377bOjU9e37
-      - SERVICES=s3,iam,logs,dynamodb,cloudwatch,config
+      - SERVICES=s3,iam,logs,dynamodb,cloudwatch,config,lambda,apigateway,cloudformation,ec2
       - DEBUG=0
       - AWS_DEFAULT_REGION=us-east-1
       - PERSISTENCE=1
